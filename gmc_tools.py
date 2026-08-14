@@ -26,7 +26,7 @@ import sys
 
 # set parameters
 DEFAULT_BAUD_RATE = 115200
-DEFAULT_PORT = '/dev/cu.usbserial-1140'
+DEFAULT_PORT = ''  # set at runtime from list_ports() or set_port(); platform-specific
 DEFAULT_DATA_BITS = 8
 DEFAULT_PARITY = 0
 DEFAULT_STOP_BIT = 1
@@ -44,12 +44,18 @@ logger = logging.getLogger()  # Create logging object
 logger.setLevel(logging.DEBUG)
 
 
-def test_serial(test_port=default_port, ) -> str:
+def test_serial(test_port=None) -> str:
     """
     Test if serial connection is functioning
-    :param test_port: string /dev/serial_port
+    :param test_port: serial port name ('COM5' on Windows, '/dev/cu.*' on macOS/Linux)
     :returns: Text message success or error
     """
+    if test_port is None:
+        test_port = default_port
+    if not test_port:
+        msg: str = 'Error: No serial port selected. Choose a port and press Set Port.'
+        logger.error(msg)
+        return msg
     try:
         # print(f'Testing port {test_port}\n')
         ser = serial.Serial(test_port, DEFAULT_BAUD_RATE)
@@ -61,49 +67,63 @@ def test_serial(test_port=default_port, ) -> str:
     return msg
 
 
-def send_command(command: bytes, b_len: int):
+def send_command(command: bytes, b_len: int) -> bytes:
     """
     Send a command to the device
     :param command: as bytes
     :param b_len: length of bytes
-    :returns: Error message if not successful
+    :returns: the device response as bytes
+    :raises serial.SerialException: if the port cannot be opened or the write/read fails
     """
     global default_port
     ser_test = test_serial(default_port)
     if "Error" in ser_test:
-        print(ser_test[7:])
-        logger.error('Error occurred! Check serial connection')
-        return f'Error occurred! Check serial connection'
-    else:
-        with serial.Serial(default_port, DEFAULT_BAUD_RATE, bytesize=DEFAULT_DATA_BITS, timeout=DEFAULT_TIMEOUT) as ser:
-            try:
-                ser.write(command)
-                ans = ser.read(b_len)
-            except FileNotFoundError as e:
-                logger.error(f'Error {e}')
-                return f'Error {e}'
-            return ans
+        logger.error(f'Error occurred! Check serial connection: {ser_test}')
+        raise serial.SerialException(ser_test.removeprefix('Error: '))
+    with serial.Serial(default_port, DEFAULT_BAUD_RATE, bytesize=DEFAULT_DATA_BITS, timeout=DEFAULT_TIMEOUT) as ser:
+        try:
+            ser.write(command)
+            ans = ser.read(b_len)
+        except (OSError, serial.SerialException) as e:
+            logger.error(f'Error {e}')
+            raise serial.SerialException(f'Communication failed: {e}') from e
+        return ans
 
 
 def list_ports(symlinks=True) -> list:
-    """Return all available serial ports with details, sets default serial port"""
-    port_list: list = []
+    """
+    Return all available serial ports, and pre-select a likely USB-serial device.
+
+    Port names are taken from pyserial's ``device`` attribute so they are valid on the
+    host platform as-is: 'COM5' on Windows, '/dev/cu.usbserial-1140' on macOS/Linux.
+    """
+    global default_port
     try:
         port_list = serial.tools.list_ports.comports(include_links=symlinks)
-        port_list.sort()
     except Exception as e:
-        msg: str = f'Error getting port list {e}'
-        return msg
-    finally:
-        res: str = "Available ports: \n"
-        for item in port_list:
-            res = res + str(item) + "\n"
-            if item.description == "USB Serial":
-                global default_port
-                default_port = f'/dev/{item.name}'
-                logger.info(f'Default Port set to: {default_port}')
-        ports = ['/dev/' + item.name for item in port_list]
-    return ports
+        logger.error(f'Error getting port list {e}')
+        return []
+    port_list = sorted(port_list, key=lambda item: item.device)
+    for item in port_list:
+        # The GMC-500+ shows up through a USB-serial bridge; the exact wording of the
+        # description varies by driver ('USB Serial', 'USB-SERIAL CH340', ...).
+        if 'usb' in (item.description or '').lower():
+            default_port = item.device
+            logger.info(f'Default Port set to: {default_port}')
+            break
+    return [item.device for item in port_list]
+
+
+def set_port(port: str) -> str:
+    """
+    Set the serial port used by all subsequent commands.
+    :param port: port name as returned by list_ports()
+    :returns: confirmation message
+    """
+    global default_port
+    default_port = port
+    logger.info(f'Port set to: {default_port}')
+    return f'Port set to: {default_port}'
 
 
 def power_up() -> str:
@@ -266,9 +286,10 @@ def get_save_type(save_type) -> list:
         save_text = 'Every Minute if exceeding threshold'
         save_intval = 60
     else:
-        save_text = f'Error false save interval: {save_type} (allowed is: 0, 1, 2, 3, 4, 5)'
-        print(save_text)
-        sys.exit(1)
+        # Do not abort the whole export (and, from the GUI, the app) over one odd byte.
+        save_text = f'Unknown save interval: {save_type} (allowed is: 0, 1, 2, 3, 4, 5)'
+        save_intval = 1
+        logger.warning(save_text)
     return [save_text, save_intval]
 
 
@@ -282,103 +303,120 @@ def bin_to_csv(in_file='20231007_17_19_34.bin', out_file='20231007_17_19_34.csv'
     :param out_file:
     :return:
     """
-    global record_timestamp, save_interval, new_timestamp, save_txt, record_time
-    global store_data
-    store_data = False
-    # Create empty dataframe with column names to store parsed data
-    column_names = ['DateTime', 'Type', 'CPM'] + [f'# {x} CPS' for x in range(1, 61)]
-    parsed_df = pd.DataFrame(columns=column_names)
-    # Read bin file in chunks
     logger.info(f'Reading file {in_file} for parsing')
     with open(in_file, 'rb') as file:
-        # try reading all data
-        chunk = file.read()
-    data_length = len(chunk)  # parse all data in one chunk
-    record = chunk
-    i = 0  # counter for byte number
-    counter_per_minute = 0  # counter for counts per minute read
-    lst = []  # create empty list for data rows
-    cps = 0  # create counter for counts per second
-    # Parse data, if marker found, get timestamp, then continue to collect and add 60 counts to list
-    # if one minute is full, add list to new row in dataframe. empty list. add 1 minute to timestamp and add
-    # timestamp, save interval text and next 60 counts to list.
-    # Device creates a timestamp every 180 seconds.
-    while i < data_length:
-        if record[i] == 0x55:  # read byte and check if it is start of a sequence marker
-            if record[i + 1] == 0xaa:
-                if record[i + 2] == 0 or record[i + 2] == 5:  # check for enumeration code that date/timestamp follows
-                    if record[i + 2] == 5:  # we have a new timestamp, need to empy the list
-                        i += 4
-                        record_time = create_record_time(record[i:i + 10])  # get the timestamp
-                        cps = 0  # reset counts per second
-                        lst = []
-                        new_timestamp = True
-                    else:
-                        record_time = create_record_time(record[i:i + 10])  # get the timestamp
-                        new_timestamp = True
-                    if len(lst) == 2:
-                        lst = []
-                    lst.append(record_time)
-                    store_data = True  # only store data if we have a date and time
-                    # check history saving mode 1s, 60s or 1 hour
-                    save_type = record[i + 11]
-                    save_txt = get_save_type(save_type)[0]
-                    save_interval = get_save_type(save_type)[1]
-                    lst.append(save_txt)
-                    i += 12  # jump to first position after date and time
-                elif record[i + 2] == 1:
-                    # double data byte in the form [55][AA][01][DH][DL] represents data
-                    # whose value exceeded 255 and needs two bytes
-                    print(f'double data stuff: {record[i:i + 12]}')
-                    msb = record[i + 3]  # most significant bit
-                    lsb = record[i + 4]  # least significant bit
-                    cpm = msb * 256 + lsb
-                    cpmtime = datetime.datetime.fromtimestamp(
-                        record_time + counter_per_minute * save_interval).strftime(
-                        '%Y-%m&d %H:%M:%S')
-                    record_string = f' {i:5d}, {cpmtime:19s}, {cpm:3d}'
-                    print(f'{record_string}, double byte data')
-                    i += 4
-                    counter_per_minute += 1
-            else:  # 0x55 is genuine cpm, no tag code
-                cpx = record[i]
-                if store_data:
-                    lst.append(i)
-                i += 1
-                cps += 1
-        if store_data:
-            lst.append(record[i])
-            cps += 1
-        i += 1
-        # If 60s of data have been parsed, add list to dataframe and start new empty list.
-        if cps == 60:
-            lst.insert(2, sum(lst[2:62]))  # add counts per minute
-            parsed_df.loc[len(parsed_df)] = lst
-            cps = 0
-            lst = []
-            # add one minute to timestamp
-            record_time_new = record_time + datetime.timedelta(minutes=1.0)
-            if len(lst) != 0:
-                print(f'list is {len(lst)} long.')
-            elif len(lst) == 0:
-                record_time = record_time_new
-                lst.append(record_time)
-                lst.append(save_txt)
-        # The 0xFF (255) data indicates an area of the history buffer that has no data recorded -> end loop
-        if record[i] == 255 and record[i + 1] == 255 and record[i + 2] == 255:
-            write_csv(final_df=parsed_df, out_file=out_file)
-            logger.info(f'Parsing complete, csv export complete.')
-            return f'Finished parsing, csv export done.'
+        record = file.read()
+    # 0xFF marks the erased/unwritten tail of the flash; nothing beyond it is data.
+    record = record.rstrip(b'\xff')
+
+    segments = _split_segments(record)
+    rows = []
+    for start_time, save_type, counts in segments:
+        rows.extend(_counts_to_rows(start_time, save_type, counts))
+
+    column_names = ['DateTime', 'Type', 'CPM'] + [f'# {x} CPS' for x in range(1, 61)]
+    parsed_df = pd.DataFrame(rows, columns=column_names)
     write_csv(final_df=parsed_df, out_file=out_file)
+    msg = f'Finished parsing, csv export done. {len(segments)} blocks -> {len(parsed_df)} rows.'
+    logger.info(msg)
+    return msg
+
+
+def _split_segments(record) -> list:
+    """
+    Split the raw history into (timestamp, save_type, counts) segments.
+
+    On-disk layout, confirmed against a GMC-500+ Re 2.53 dump: a 12-byte header
+    ``55 AA 00 YY MM DD HH MM SS 55 AA 01`` followed by one count byte per sample
+    interval, until the next header. In per-second mode the device emits a header
+    every 180 s, giving the characteristic 192-byte record.
+    """
+    segments = []
+    current = None  # (timestamp, save_type, [counts])
+    last_save_type = 1  # per-second logging until the file says otherwise
+    i = 0
+    end = len(record)
+    while i < end:
+        if record[i] == 0x55 and i + 2 < end and record[i + 1] == 0xAA:
+            tag = record[i + 2]
+            if tag in (0x00, 0x05):
+                # 0x05 carries a 4-byte preamble before the date bytes
+                base = i + 4 if tag == 0x05 else i
+                stamp = _read_timestamp(record, base)
+                if stamp is not None:
+                    i = base + 9  # past 55 AA 00 + the six date bytes
+                    # A 55 AA <n> marker follows the date. Normally n is the save mode
+                    # (01 = every second). In stretches where the device stamps every
+                    # single second, n varies per record and is not a mode - keep the
+                    # last real mode there, but always consume the marker so that 0x55
+                    # and 0xAA can never be mistaken for counts.
+                    if record[i:i + 2] == b'\x55\xaa' and i + 2 < end:
+                        if record[i + 2] in (1, 2, 3):
+                            last_save_type = record[i + 2]
+                        i += 3
+                    current = (stamp, last_save_type, [])
+                    segments.append(current)
+                    continue
+            elif tag == 0x01 and i + 4 < end:
+                # [55][AA][01][DH][DL]: a single count that did not fit in one byte
+                if current is not None:
+                    current[2].append(record[i + 3] * 256 + record[i + 4])
+                i += 5
+                continue
+            elif tag == 0x02 and i + 3 < end:
+                # ASCII note: [55][AA][02][len][text...]
+                i += 4 + record[i + 3]
+                continue
+            elif tag in (0x03, 0x04):
+                i += 4
+                continue
+            else:
+                # An unrecognised marker: skip the 55 AA <tag> triplet rather than
+                # letting 0x55/0xAA be recorded as counts of 85 and 170.
+                logger.debug(f'skipping unknown marker 55 AA {tag:02X} at {i}')
+                i += 3
+                continue
+        if current is not None:
+            current[2].append(record[i])
+        i += 1
+    return segments
+
+
+def _read_timestamp(record, base):
+    """Return the datetime at ``base``, or None if those bytes are not a valid date."""
+    if base + 8 >= len(record):
+        return None
+    try:
+        return datetime.datetime(2000 + record[base + 3], record[base + 4], record[base + 5],
+                                 record[base + 6], record[base + 7], record[base + 8])
+    except ValueError:
+        return None  # ordinary count data that happens to look like a marker
+
+
+def _counts_to_rows(start_time, save_type, counts) -> list:
+    """Chunk one segment's counts into per-minute rows: [DateTime, Type, CPM, 60x CPS]."""
+    save_txt, save_interval = get_save_type(save_type)
+    if save_interval == 0:
+        return []
+    rows = []
+    per_row = 60 if save_interval == 1 else 1  # per-second data groups 60 samples to a minute
+    for offset in range(0, len(counts), per_row):
+        block = counts[offset:offset + per_row]
+        row_time = start_time + datetime.timedelta(seconds=offset * save_interval)
+        # pad short trailing blocks so every row has the same width
+        padded = list(block) + [None] * (60 - len(block))
+        rows.append([row_time, save_txt, sum(block)] + padded)
+    return rows
 
 
 def write_csv(final_df, out_file):
     """Write the parsed data to a csv file"""
-    # Add some text to the first row before creating the csv file
-    header_text = """GMC-500+ Data Tool
-    {}"""
-    with open(out_file, 'w') as fp:
-        fp.write(header_text.format(final_df.to_csv(index=False)))
+    # Add a title row above the data. Keep the column header flush left, otherwise the
+    # leading whitespace becomes part of the first column name. newline='' stops the
+    # line endings pandas emits from being translated a second time on Windows.
+    with open(out_file, 'w', newline='') as fp:
+        fp.write('GMC-500+ Data Tool\n')
+        fp.write(final_df.to_csv(index=False))
     return f'Parsed BIN file and wrote data to file.'
 
 
