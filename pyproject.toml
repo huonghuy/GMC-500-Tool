@@ -1,9 +1,10 @@
 [tool.poetry]
-name = "gmc-500+ tool"
+package-mode = false
+name = "gmc-500-tool"
 version = "0.1.0"
 description = "Tool to read, write and parse data from the GMC-500+ Geiger Counter"
 authors = ["Martin.Heinrich <75615821+martinheinrich2@users.noreply.github.com>"]
-readme = "README.md"
+readme = "Readme.md"
 
 [tool.poetry.dependencies]
 python = "^3.11"
