@@ -30,7 +30,8 @@ class App(customtkinter.CTk):
 
     # Display errors in widget
     @staticmethod
-    def show_error(self, exc, val, tb, *args):
+    def show_error(exc, val, tb, *args):
+        logger.error(f'{exc.__name__}: {val}')
         messagebox.showerror(title='Error', message=str(val))
 
     # Override internal function to show errors
@@ -39,7 +40,12 @@ class App(customtkinter.CTk):
     # Create functions to be called by the UI
     def set_port(self):
         """Set and display chosen serial port"""
-        self.port.set(self.om1.get())
+        chosen = self.om1.get()
+        if not chosen or chosen == "Select Port First":
+            self.status.set('No port selected.')
+            return
+        self.port.set(chosen)
+        self.status.set(gmc_tools.set_port(chosen))
         return
 
     def get_version(self):
@@ -109,32 +115,38 @@ class App(customtkinter.CTk):
         out_path = asksaveasfilename(filetypes=files, defaultextension='.BIN',
                                      initialdir=os.getcwd(),
                                      initialfile=out_file)
+        if not out_path:  # user cancelled the save dialog
+            self.status.set('History read cancelled.')
+            return 'History read cancelled.'
         self.status.set('Reading history ...')
         record = b''
         # set the number of times a page from flash memory will be read
         num_of_runs = int(DEFAULT_FLASH_SIZE / data_length)
 
         # send history request to device
-        for i in range(1, num_of_runs + 1):
+        for i in range(num_of_runs):
             # pack address into 4 bytes, big endian for transmission as MSB to LSB; then clip 1st bye = high byte
             # struck.pack with ">" uses big endian ordering
+            # start at address 0: the first page holds the oldest records and the first timestamp
             address = data_length * i
             ad = struct.pack(">I", address)[1:]
             # pack data_length into 2 byes, big endian; use all bytes
             dl = struct.pack(">H", data_length)
             logger.info(f'{i:>3}: requesting data length: {data_length:5d} (0x{dl[0]:02x}{dl[1]:02x}) address: '
                         f'{address:5d} (0x{ad[0]:02x}{ad[1]:02x}{ad[2]:02x})')
-            status_msg = f'Reading block {i:>3} of {num_of_runs}'
+            status_msg = f'Reading block {i + 1:>3} of {num_of_runs}'
             self.status.set(status_msg)
             self.update()
             data_page = gmc_tools.send_command(b'<SPIR' + ad + dl + b'>>', data_length)
             record = record + data_page
-        if record is not None:
+        if record:
             msg = f"received: {len(record):5d}"
             logger.info(msg)
         else:
             msg = "ERROR: No data received"
             logger.error(msg)
+            self.status.set(msg)
+            return msg
         # write history in binary file
         with open(out_path, 'wb') as f_out:
             f_out.write(record)
@@ -145,6 +157,9 @@ class App(customtkinter.CTk):
         """Load history file, parse and export to csv"""
         data = [('BIN File(*.bin)', '*.bin')]
         hist_path = askopenfilename(filetypes=data)
+        if not hist_path:  # user cancelled the open dialog
+            self.status.set('Parse cancelled.')
+            return
         file_path = Path(hist_path)
         out_path = file_path.with_suffix(".csv")
         self.status.set(gmc_tools.bin_to_csv(in_file=hist_path, out_file=out_path))
